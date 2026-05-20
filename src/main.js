@@ -1,3 +1,4 @@
+///
 import * as THREE from "three";
 import {HDRLoader} from 'three/examples/jsm/loaders/HDRLoader.js';
 import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls.js';
@@ -49,6 +50,9 @@ const spacing = ballRadius * 2; // المسافة بين مراكز الكرات
 
 const damping = 0.999;          // فقدان تدريجي للطاقة
 const collisionLoss = 0.99;     // فقدان طاقة عند التصادم
+
+const airDrag = 0.02;        // مقاومة الهواء (قوة تعاكس السرعة)
+const pivotFriction = 0.01;  // احتكاك نقطة التعليق (يعاكس السرعة الزاوية)
 
 const balls = []; // وضع بيانات كل كرة
 //---------------------------------------------------------------------------------------------------
@@ -179,6 +183,7 @@ for (let i = 0; i < ballCount; i++) {
     pivotX,
     index: i,
     prevTheta: 0,
+    mass: 1, // كتلة الكرة (نفس الكتلة للجميع)
   });
 }
 //----------------------------------------------------------------------------------------------------
@@ -192,8 +197,18 @@ const params = {
   ballRadius: 0.5,      // حجم الكرة
   timeScale: 1.0,        // سرعة الحركة
   frequency: 0,
+  airDrag: 0.02,
+  pivotFriction: 0.01,
 
 };
+params.anglesText = "";
+params.velocitiesText = "";
+params.tension = 0;
+params.energy = 0;
+params.collisionCount = 0;
+params.collisionType = "—";
+
+params.massFactor = 1.0;
 
 
 // التحكم بعدد الكرات المسحوبة
@@ -223,7 +238,7 @@ gui.add(params, "damping")
 // فقدان الطاقة عند التصادم 
 gui.add(params, "collisionLoss")
    .min(0.8).max(1.0).step(0.01)
-   .name("فقدان التصادم");
+   .name("معامل الارتداد");
 // طول الخيط
 gui.add(params, "stringLength")
    .min(2).max(5.6).step(0.1)
@@ -242,10 +257,32 @@ params.thetaDisplay = 0;
 
 gui.add(params, "frequency").name("التردد  (Hz)").listen();
 gui.add(params, "period").name("الزمن الدوري (s)").listen();
-gui.add(params, "velocity").name("سرعة الكرة").listen();
-gui.add(params, "thetaDisplay").name("زاوية الكرة (rad)").listen();
+gui.add(params, "tension").name("قوة الشد (N)").listen();
+gui.add(params, "energy").name("الطاقة الكلية").listen();
+gui.add(params, "collisionCount").name("عدد التصادمات").listen();
+gui.add(params, "collisionType").name("نوع التصادم").listen();
 
+gui.add(params, "airDrag").min(0).max(0.05).step(0.001).name("مقاومة الهواء");
+gui.add(params, "pivotFriction").min(0).max(0.05).step(0.001).name("احتكاك نقطة التعليق");
+gui.add(params, "timeScale").min(0.1).max(3).step(0.1).name("سرعة الزمن");
+  //التحكم بكتلة كرة واحدة لإظهار أن القوانين تعمل بشكل صحيح
+gui.add(params, "massFactor").min(0.5).max(3).step(0.1).name("كتلة الكرة 1");
+
+const anglesFolder = gui.addFolder("زوايا الكرات");
+const velocitiesFolder = gui.addFolder("سرعات الكرات");
+
+balls.forEach((b, i) => {
+  const idx = i + 1;
+  params[`theta${idx}`] = 0;
+  params[`vel${idx}`] = 0;
+
+  anglesFolder.add(params, `theta${idx}`).name(`θ${idx}`).listen();
+  velocitiesFolder.add(params, `vel${idx}`).name(`v${idx}`).listen();
+   });
+
+///
 //-----------------------------------------------------------------------------------------------
+///
 // تابع سحب الكرات
 function pullBalls(side) {
   const n = params.pulledCount;
@@ -287,63 +324,78 @@ function updateBallPosition(b) {
   b.string2.geometry.setFromPoints([rightAttach, bottomRight]);
 }
 //--------------------------------------------------------------------------------------------------
-function handleCollisions() {
-  const left = balls[0];
-  const right = balls[balls.length - 1];
-//حساب ما إذا مرت الكرة من المنتصف (من اليسار إلى اليمين أو العكس) بين الإطارين الحالي والسابق    
-  const crossedCenterLeft =
-    (left.prevTheta > 0 && left.theta <= 0) ||
-    (left.prevTheta < 0 && left.theta >= 0);
+//معالجة التصادم
+function handleCollisions(dt) {
+  const R = params.ballRadius;
+  const e = params.collisionLoss; // معامل الارتداد (0 < e ≤ 1)
 
-  const crossedCenterRight =
-    (right.prevTheta > 0 && right.theta <= 0) ||
-    (right.prevTheta < 0 && right.theta >= 0);
+  
 
-  const n = params.pulledCount; // عدد الكرات المسحوبة
+  for (let i = 0; i < balls.length - 1; i++) {
+    const b1 = balls[i];
+    const b2 = balls[i + 1];
 
-  // تصادم من اليسار → اليمين
-  if (crossedCenterLeft && Math.abs(left.omega) > 0.005) {
-     if (collisionSound.isPlaying) collisionSound.stop();
-    collisionSound.play();
-    for (let i = 0; i < n; i++) {
-      const from = balls[i];                         // من اليسار
-      const to   = balls[balls.length - 1 - i];      // إلى اليمين
+  const m1 = b1.mass;
+  const m2 = b2.mass;
+    // مواضع مراكز الكرتين على المحور x
+    const x1 = b1.group.position.x + b1.ball.position.x;
+    const x2 = b2.group.position.x + b2.ball.position.x;
 
-      const v = from.length * from.omega;
-      to.omega = (v / to.length) * params.collisionLoss;
+    const dx = x2 - x1;
+    const dist = Math.abs(dx);
+    const minDist = 2 * R;
 
-      from.omega = 0;
-      from.theta = 0;
-    }
-    // اهتزاز بسيط للكرات الوسطى
-    for (let i = n; i < balls.length - n; i++) {
-      const mid = balls[i];
-      mid.theta += (Math.random() - 0.5) * 0.04;
-    }
-  }
-  //-------------------------
-  // تصادم من اليمين → اليسار
-  if (crossedCenterRight && Math.abs(right.omega) > 0.005) {
-     if (collisionSound.isPlaying) collisionSound.stop();
-    collisionSound.play();
+    // هل الكرتان متلامستان أو متداخلتان قليلاً؟
+    if (dist <= minDist + 1e-4) {
+      // السرعات الخطية على المحور x (v = L * omega)
+      const v1 = b1.length * b1.omega;
+      const v2 = b2.length * b2.omega;
 
-    for (let i = 0; i < n; i++) {
-      const from = balls[balls.length - 1 - i]; // من اليمين
-      const to   = balls[i];                    // إلى اليسار
+      const relV = v2 - v1;
 
-      const v = from.length * from.omega;
-      to.omega = (v / to.length) * params.collisionLoss;
+      // إذا الكرتان تبتعدان، لا نحتاج تصادم
+      if (relV >= 0) continue;
 
-      from.omega = 0;
-      from.theta = 0;
-    }
+      // معادلات التصادم لجسمين متساويي الكتلة مع معامل ارتداد e
+     
+const v1After = ( (m1 - e*m2)*v1 + (1+e)*m2*v2 ) / (m1 + m2);
+const v2After = ( (m2 - e*m1)*v2 + (1+e)*m1*v1 ) / (m1 + m2);
+      // تحويل السرعات الخطية إلى سرعات زاوية
+      b1.omega = v1After / b1.length;
+      b2.omega = v2After / b2.length;
 
-    for (let i = n; i < balls.length - n; i++) {
-      const mid = balls[i];
-      mid.theta += (Math.random() - 0.5) * 0.02;
+      // تصحيح تداخل بسيط لتجنب غرق الكرات
+      if (dist < minDist) {
+        const penetration = minDist - dist;
+        const dir = dx >= 0 ? 1 : -1;
+        const correction = penetration * 0.5;
+
+        b1.ball.position.x -= correction * dir;
+        b2.ball.position.x += correction * dir;
+      }
+      // عد التصادمات القوية فقط
+     if (Math.abs(relV) > 0.25) {
+  params.collisionCount++;
+}
+
+      //  تشغيل الصوت بشكل واقعي
+      const speedThreshold = 0.25;
+      const now = performance.now();
+
+      if (Math.abs(relV) > speedThreshold) {
+        if (
+          !handleCollisions.lastSoundTime ||
+          now - handleCollisions.lastSoundTime > 50
+        ) {
+          if (collisionSound.isPlaying) collisionSound.stop();
+          collisionSound.play();
+          handleCollisions.lastSoundTime = now;
+        }
+      }
     }
   }
 }
+
 //-----------------------------------------------------------------------------------------------------
 // تحديث طول الخيط عند تغييره من الواجهة
 function updateStringLength() {
@@ -407,41 +459,73 @@ const clock = new THREE.Clock();
 function animate() {
   const dt = clock.getDelta() * params.timeScale;
 
-  balls.forEach((b, i) => {
-    b.prevTheta = b.theta;
-    b.alpha = -(g / b.length) * Math.sin(b.theta);
-    b.omega += b.alpha * dt;
-    b.omega *= params.damping;
-    b.theta += b.omega * dt;
+balls.forEach((b, i) => {
+  b.prevTheta = b.theta;
 
-    // تحديث القيم الفيزيائية للعرض
-// إيجاد الكرة التي تتحرك فعليًا
-let activeBall = balls[0];
-let maxOmega = Math.abs(balls[0].omega);
+  // تسارع زاوي من القوة الاسترجاعية
+  b.alpha = -(g / b.length) * Math.sin(b.theta);
+  b.omega += b.alpha * dt;
 
-balls.forEach(b => {
-  if (Math.abs(b.omega) > maxOmega) {
-    maxOmega = Math.abs(b.omega);
-    activeBall = b;
-  }
+  // مقاومة الهواء: قوة تعاكس السرعة (Fdrag = -k v)
+  b.omega -= airDrag * b.omega * dt;
+
+  // احتكاك نقطة التعليق: عزم يعاكس السرعة الزاوية (τ = -c ω)
+  b.omega -= pivotFriction * b.omega * dt;
+
+  // تخميد عام قابل للتحكم من الواجهة
+  b.omega *= params.damping;
+
+  // تحديث الزاوية
+  b.theta += b.omega * dt;
+
+  updateBallPosition(b);
+});
+// معلومات للعرض في GUI
+// اختيار كرة مرجعية (مثلاً الكرة الوسطى)
+const ref = balls[Math.floor(balls.length / 2)];
+// حساب الزمن الدوري النظري للبندول البسيط
+const T = 2 * Math.PI * Math.sqrt(ref.length / g);
+params.period = T.toFixed(3);
+// حساب التردد
+params.frequency = (1 / T).toFixed(3);
+//  حساب قوة الشد في الخيط
+params.tension = (
+  ref.mass * (g * Math.cos(ref.theta) + ref.length * ref.omega * ref.omega)
+).toFixed(3);
+// حساب الطاقة الكلية
+const v = ref.length * ref.omega;
+const K = 0.5 * ref.mass * v * v;
+const U = ref.mass * g * (ref.length - (-ref.length * Math.cos(ref.theta)));
+params.energy = (K + U).toFixed(3);
+// عرض نوع التصادم بناء على قيمة معامل الارتداد
+params.collisionType =
+  (params.collisionLoss > 0.95 ? "شبه مرن" :
+   params.collisionLoss > 0.85 ? "غير مرن جزئياً" :
+   "غير مرن") + ` (e=${params.collisionLoss.toFixed(2)})`;
+
+// حساب زاوية وسرعة كل كرة
+balls.forEach((b, i) => {
+  const idx = i + 1;
+  params[`theta${idx}`] = b.theta.toFixed(3);
+  params[`vel${idx}`] = (b.length * b.omega).toFixed(3);
+
 });
 
-// تحديث القيم الفيزيائية
-params.frequency = ((1 / (2 * Math.PI)) * Math.sqrt(g / params.stringLength)).toFixed(3);
-params.period = (2 * Math.PI * Math.sqrt(params.stringLength / g)).toFixed(3);
-params.velocity = (activeBall.length * activeBall.omega).toFixed(3);
-params.thetaDisplay = activeBall.theta.toFixed(3);
+  balls[0].mass = params.massFactor;
+for (let i = 1; i < balls.length; i++) {
+  balls[i].mass = 1;
+}
 
+ // تكرار حل التصادم عدة مرات لانتقال النبضة عبر الكرات الوسطى
+for (let iter = 0; iter < 2; iter++) {
+  handleCollisions(dt);
+}
 
-    updateBallPosition(b);
-  });
-
-  handleCollisions();
   controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
-}
 
+}
 animate();
 //-----------------------------------------------------------------------------------------------------
 // تحديث حجم العرض عند تغيير حجم النافذة لضمان تناسب العرض مع الكاميرا
@@ -452,4 +536,4 @@ window.addEventListener("resize", () => {
   camera.updateProjectionMatrix();
   renderer.setSize(sizes.width, sizes.height);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-});
+});///
